@@ -1,8 +1,8 @@
 ## Train a model with up to date lerobot main branch
-1. Update the sigularity container using script 1 on your local computer
+1. Update the sigularity container (run local)
    ```bash
    ./build_singularity_local.sh
-3. Pull the up to date container in cluster using script 2
+3. Pull the up to date container (run on cluster)
    ```bash
    ./singularity_build/pull_singularity_cluster.sh
 5. Run a Job script
