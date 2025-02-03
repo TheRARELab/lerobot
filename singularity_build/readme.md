@@ -1,4 +1,4 @@
-## To train a model with up to date lerobot main branch
+## Train a model with up to date lerobot main branch
 1. Update the sigularity container using script 1 on your local computer
    ```bash
    ./build_singularity_local.sh
@@ -12,5 +12,5 @@
 
 # ToDo
 - [x] Add script to pull lastest docker image, install hydra, build singularity container and update it. (runs in local)
-- [x] Add script to Pull latest singularity container to /sigularity_build directory
+- [x] Add script to pull latest singularity container to /sigularity_build directory
  
