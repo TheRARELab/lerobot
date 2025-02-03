@@ -11,6 +11,6 @@
 7. Email notification will be sent when job starts, end, fail or requeued.
 
 # ToDo
-- [ ] Add script to pull lastest docker image, install hydra, build singularity container and update it. (runs in local)
-- [ ] Add script to Pull latest singularity container to /sigularity_build directory
+- [x] Add script to pull lastest docker image, install hydra, build singularity container and update it. (runs in local)
+- [x] Add script to Pull latest singularity container to /sigularity_build directory
  
