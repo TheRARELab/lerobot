@@ -1,0 +1,7 @@
+Bootstrap: docker
+From: amanuelergogo/lerobot:dev
+
+%post
+    apt-get update && apt-get install -y python3-pip
+    pip install hydra-core
+
