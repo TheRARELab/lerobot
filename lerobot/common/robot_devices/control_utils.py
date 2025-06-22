@@ -298,6 +298,10 @@ def reset_environment(robot, events, reset_time_s):
     # TODO(alibets): allow for teleop during reset
     if has_method(robot, "teleop_safety_stop"):
         robot.teleop_safety_stop()
+        
+    # Disable torque
+    for name in robot.follower_arms:
+        robot.follower_arms[name].write("Torque_Enable", 0)
 
     timestamp = 0
     start_vencod_t = time.perf_counter()
