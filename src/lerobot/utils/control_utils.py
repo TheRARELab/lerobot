@@ -175,7 +175,11 @@ def init_keyboard_listener():
 
     return listener, events
 
-
+"""Code below added from therarelab/lerobot to preserve our custom modification for disabling torque.
+During sync, this file had a merge conflict: we had modified it to add the disable torque feature,
+while upstream had deleted it due to a codebase restructure.
+Resolved by keeping changes from both sides.
+"""
 def init_policy(pretrained_policy_name_or_path, policy_overrides):
     """Instantiate the policy and load fps, device and use_amp from config yaml"""
     pretrained_policy_path = get_pretrained_policy_path(pretrained_policy_name_or_path)
