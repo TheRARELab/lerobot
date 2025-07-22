@@ -175,7 +175,7 @@ def init_keyboard_listener():
 
     return listener, events
 
-"""Code below added from therarelab/lerobot to preserve our custom modification for disabling torque.
+"""Code below added from therarelab/lerobot to preserve our modification for disabling torque.
 During sync, this file had a merge conflict: we had modified it to add the disable torque feature,
 while upstream had deleted it due to a codebase restructure.
 Resolved by keeping changes from both sides.
