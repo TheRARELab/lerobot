@@ -77,6 +77,24 @@ class ACTPolicy(PreTrainedPolicy):
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
 
+        # Debug / introspection configuration.
+        # This controls whether predicted chunks are stored in memory and whether occasional summaries
+        # are printed so a human can understand what the robot is about to do.
+        self.store_action_chunks = True
+        self.print_action_summaries = True
+        self.print_summary_every = 10  # Print every N predicted chunks.
+
+        # Debug / introspection storage.
+        # These lists keep the raw predicted chunks, executed actions, and pending queue snapshots
+        # for later inspection after a rollout.
+        self.predicted_action_chunks_history = []
+        self.executed_action_history = []
+        self.pending_action_queue_snapshots = []
+
+        # Debug / introspection counter.
+        # This counts how many action chunks have been predicted so far in the current episode.
+        self._prediction_counter = 0
+
         self.reset()
 
     def get_optim_params(self) -> dict:
@@ -107,6 +125,82 @@ class ACTPolicy(PreTrainedPolicy):
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
 
+        # Reset debug / introspection storage for the new episode.
+        # This clears all logged predicted chunks, executed actions, queue snapshots,
+        # and resets the chunk prediction counter.
+        self.predicted_action_chunks_history = []
+        self.executed_action_history = []
+        self.pending_action_queue_snapshots = []
+        self._prediction_counter = 0
+
+    def _summarize_action_chunk(self, actions: Tensor) -> str:
+        """Build a compact human-readable summary of a predicted action chunk.
+
+        This method is meant for debugging and monitoring. It reports:
+        - which prediction number this is,
+        - the shape of the predicted chunk,
+        - the first few values of the immediate next action,
+        - the average absolute action magnitude across the chunk,
+        - the average magnitude of the first few timesteps.
+
+        This gives a human a quick sense of what the robot is about to do
+        without printing the full tensor.
+        """
+        actions_cpu = actions.detach().cpu()
+
+        # Use the first batch element for the summary.
+        # In live robot inference, batch size is typically 1.
+        chunk = actions_cpu[0]
+
+        # Extract the immediate next action and simple magnitude statistics.
+        next_action = chunk[0]
+        mean_abs_action = chunk.abs().mean().item()
+        step_magnitudes = chunk.abs().mean(dim=-1)
+
+        # Shorten the printed output so logs stay readable.
+        next_action_preview = [round(x, 4) for x in next_action[: min(6, next_action.numel())].tolist()]
+        first_five_magnitudes = [round(x, 4) for x in step_magnitudes[:5].tolist()]
+
+        lines = [
+            f"[ACT] prediction #{self._prediction_counter}",
+            f"  chunk shape: {tuple(actions_cpu.shape)}",
+            f"  next action[:6]: {next_action_preview}",
+            f"  mean abs action over chunk: {mean_abs_action:.4f}",
+            f"  first 5 step magnitudes: {first_five_magnitudes}",
+        ]
+        return "\n".join(lines)
+
+    def _maybe_print_action_summary(self, actions: Tensor) -> None:
+        """Print a human-readable summary only at the configured interval.
+
+        This avoids printing every chunk prediction, which would create noisy logs
+        and could slow execution. Instead, it prints every `self.print_summary_every`
+        predictions when summary printing is enabled.
+        """
+        if not self.print_action_summaries:
+            return
+        if self.print_summary_every <= 0:
+            return
+        if self._prediction_counter % self.print_summary_every != 0:
+            return
+
+        print(self._summarize_action_chunk(actions))
+
+    def get_debug_action_logs(self) -> dict:
+        """Return all in-memory debug logs collected during the current episode.
+
+        This is useful after a rollout when you want to inspect:
+        - all raw predicted action chunks,
+        - all executed actions,
+        - queue snapshots captured before execution.
+        """
+        return {
+            "num_predictions": self._prediction_counter,
+            "predicted_action_chunks_history": self.predicted_action_chunks_history,
+            "executed_action_history": self.executed_action_history,
+            "pending_action_queue_snapshots": self.pending_action_queue_snapshots,
+        }
+
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations.
@@ -120,6 +214,10 @@ class ACTPolicy(PreTrainedPolicy):
         if self.config.temporal_ensemble_coeff is not None:
             actions = self.predict_action_chunk(batch)
             action = self.temporal_ensembler.update(actions)
+
+            # Store the final action actually chosen for execution.
+            # In temporal ensembling mode, this is the weighted combination returned by the ensembler.
+            self.executed_action_history.append(action.detach().cpu().clone())
             return action
 
         # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
@@ -130,7 +228,17 @@ class ACTPolicy(PreTrainedPolicy):
             # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
             self._action_queue.extend(actions.transpose(0, 1))
-        return self._action_queue.popleft()
+
+            # Save a snapshot of the pending queue immediately after it is filled.
+            # This helps inspect what actions are about to be executed in queue-based mode.
+            queue_snapshot = [queued_action.detach().cpu().clone() for queued_action in self._action_queue]
+            self.pending_action_queue_snapshots.append(queue_snapshot)
+
+        action = self._action_queue.popleft()
+
+        # Store the action actually sent for execution.
+        self.executed_action_history.append(action.detach().cpu().clone())
+        return action
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
@@ -144,6 +252,19 @@ class ACTPolicy(PreTrainedPolicy):
 
         actions = self.model(batch)[0]
         actions = self.unnormalize_outputs({ACTION: actions})[ACTION]
+
+        # Update the prediction counter for this episode.
+        # This counts how many action chunks the model has produced.
+        self._prediction_counter += 1
+
+        # Store the full raw predicted chunk in memory for later inspection.
+        # We detach, move to CPU, and clone so the saved copy is stable and does not keep graph references.
+        if self.store_action_chunks:
+            self.predicted_action_chunks_history.append(actions.detach().cpu().clone())
+
+        # Print an occasional compact summary so a human can understand what the robot is about to do.
+        self._maybe_print_action_summary(actions)
+
         return actions
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
