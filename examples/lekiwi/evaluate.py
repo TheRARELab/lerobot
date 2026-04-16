@@ -16,7 +16,12 @@ TASK_DESCRIPTION = "My task description"
 robot_config = LeKiwiClientConfig(remote_ip="172.18.134.136", id="lekiwi")
 robot = LeKiwiClient(robot_config)
 
-policy = ACTPolicy.from_pretrained("<hf_username>/<policy_repo_id>")
+policy = ACTPolicy.from_pretrained("NeilKim/act-so100-policy-3")
+
+# Enable frequent debug summaries for testing.
+# This makes the policy print a compact summary of predicted action chunks
+# so we can verify the new logging instrumentation is working.
+policy.print_summary_every = 1
 
 # Configure the dataset features
 action_features = hw_to_dataset_features(robot.action_features, "action")
@@ -25,7 +30,7 @@ dataset_features = {**action_features, **obs_features}
 
 # Create the dataset
 dataset = LeRobotDataset.create(
-    repo_id="<hf_username>/<eval_dataset_repo_id>",
+    repo_id="<vidhimudaliar/act-debug-eval>",
     fps=FPS,
     features=dataset_features,
     robot_type=robot.name,
@@ -82,6 +87,27 @@ while recorded_episodes < NUM_EPISODES and not events["stop_recording"]:
 
     dataset.save_episode()
     recorded_episodes += 1
+
+    # Print a compact summary of the in-memory debug logs collected during the episode.
+    # This verifies that predicted chunks, executed actions, and queue snapshots were stored.
+    debug_logs = policy.get_debug_action_logs()
+    print("\n[ACT DEBUG] Episode summary")
+    print("  num_predictions:", debug_logs["num_predictions"])
+    print("  predicted_action_chunks_history:", len(debug_logs["predicted_action_chunks_history"]))
+    print("  executed_action_history:", len(debug_logs["executed_action_history"]))
+    print("  pending_action_queue_snapshots:", len(debug_logs["pending_action_queue_snapshots"]))
+
+    if debug_logs["predicted_action_chunks_history"]:
+        print(
+            "  first predicted chunk shape:",
+            tuple(debug_logs["predicted_action_chunks_history"][0].shape),
+        )
+
+    if debug_logs["executed_action_history"]:
+        print(
+            "  first executed action shape:",
+            tuple(debug_logs["executed_action_history"][0].shape),
+        )
 
 # Upload to hub and clean up
 dataset.push_to_hub()
