@@ -91,6 +91,20 @@ class ACTPolicy(PreTrainedPolicy):
         self.executed_action_history = []
         self.pending_action_queue_snapshots = []
 
+        # Cartesian / image-space trajectory configuration.
+        # These optional callbacks convert predicted joint-space action chunks into
+        # Cartesian trajectories and then into image-space trajectories.
+        # They are user-provided because ACT itself does not know robot kinematics
+        # or overhead camera calibration.
+        self.joint_to_cartesian_fn = None
+        self.cartesian_to_image_fn = None
+
+        # Cartesian / image-space trajectory storage.
+        # These lists keep converted Cartesian trajectories and projected image-space
+        # trajectories for later inspection or visualization.
+        self.predicted_cartesian_chunks_history = []
+        self.predicted_image_trajectory_history = []
+
         # Debug / introspection counter.
         # This counts how many action chunks have been predicted so far in the current episode.
         self._prediction_counter = 0
@@ -133,6 +147,39 @@ class ACTPolicy(PreTrainedPolicy):
         self.pending_action_queue_snapshots = []
         self._prediction_counter = 0
 
+        # Reset Cartesian / image-space trajectory storage for the new episode.
+        self.predicted_cartesian_chunks_history = []
+        self.predicted_image_trajectory_history = []
+
+    def set_trajectory_projection_hooks(self, joint_to_cartesian_fn=None, cartesian_to_image_fn=None) -> None:
+        """Register optional callbacks for converting predicted action chunks into Cartesian and image-space trajectories.
+
+        Args:
+            joint_to_cartesian_fn:
+                Function with signature:
+                    joint_to_cartesian_fn(actions: Tensor, batch: dict[str, Tensor] | None) -> Tensor
+
+                Expected input shape:
+                    actions: (B, chunk_size, action_dim)
+
+                Expected output shape:
+                    (B, chunk_size, 3) for one tracked Cartesian point per timestep,
+                    or (B, chunk_size, N, 3) for multiple tracked points.
+
+            cartesian_to_image_fn:
+                Function with signature:
+                    cartesian_to_image_fn(cartesian_points: Tensor, batch: dict[str, Tensor] | None) -> Tensor
+
+                Expected input shape:
+                    (B, chunk_size, 3) or (B, chunk_size, N, 3)
+
+                Expected output shape:
+                    (B, chunk_size, 2) or (B, chunk_size, N, 2),
+                    where the last dimension represents image pixel coordinates (u, v).
+        """
+        self.joint_to_cartesian_fn = joint_to_cartesian_fn
+        self.cartesian_to_image_fn = cartesian_to_image_fn
+
     def _summarize_action_chunk(self, actions: Tensor) -> str:
         """Build a compact human-readable summary of a predicted action chunk.
 
@@ -141,7 +188,9 @@ class ACTPolicy(PreTrainedPolicy):
         - the shape of the predicted chunk,
         - the first few values of the immediate next action,
         - the average absolute action magnitude across the chunk,
-        - the average magnitude of the first few timesteps.
+        - the average magnitude of the first few timesteps,
+        - the first Cartesian point if Cartesian trajectories are available,
+        - the first image-space point if image trajectories are available.
 
         This gives a human a quick sense of what the robot is about to do
         without printing the full tensor.
@@ -168,6 +217,39 @@ class ACTPolicy(PreTrainedPolicy):
             f"  mean abs action over chunk: {mean_abs_action:.4f}",
             f"  first 5 step magnitudes: {first_five_magnitudes}",
         ]
+
+        # Add the first Cartesian point from the latest converted trajectory, if available.
+        if self.predicted_cartesian_chunks_history:
+            cartesian_chunk = self.predicted_cartesian_chunks_history[-1]
+            cartesian_first_point = cartesian_chunk[0, 0]
+
+            # Handle either a single tracked point (shape: [3]) or multiple tracked points (shape: [N, 3]).
+            if cartesian_first_point.ndim == 1:
+                cartesian_preview = [round(x, 4) for x in cartesian_first_point.tolist()]
+            else:
+                cartesian_preview = [
+                    [round(x, 4) for x in point]
+                    for point in cartesian_first_point.tolist()
+                ]
+
+            lines.append(f"  first Cartesian point: {cartesian_preview}")
+
+        # Add the first image-space point from the latest projected trajectory, if available.
+        if self.predicted_image_trajectory_history:
+            image_trajectory = self.predicted_image_trajectory_history[-1]
+            image_first_point = image_trajectory[0, 0]
+
+            # Handle either a single tracked point (shape: [2]) or multiple tracked points (shape: [N, 2]).
+            if image_first_point.ndim == 1:
+                image_preview = [round(x, 4) for x in image_first_point.tolist()]
+            else:
+                image_preview = [
+                    [round(x, 4) for x in point]
+                    for point in image_first_point.tolist()
+                ]
+
+            lines.append(f"  first image point: {image_preview}")
+
         return "\n".join(lines)
 
     def _maybe_print_action_summary(self, actions: Tensor) -> None:
@@ -199,7 +281,34 @@ class ACTPolicy(PreTrainedPolicy):
             "predicted_action_chunks_history": self.predicted_action_chunks_history,
             "executed_action_history": self.executed_action_history,
             "pending_action_queue_snapshots": self.pending_action_queue_snapshots,
+            "predicted_cartesian_chunks_history": self.predicted_cartesian_chunks_history,
+            "predicted_image_trajectory_history": self.predicted_image_trajectory_history,
         }
+
+    def _compute_projected_trajectories(
+        self,
+        actions: Tensor,
+        original_batch: dict[str, Tensor] | None = None,
+    ) -> None:
+        """Convert a predicted joint-space chunk into Cartesian and image-space trajectories if hooks are available.
+
+        This method does nothing unless user-provided conversion hooks are registered.
+        """
+        if self.joint_to_cartesian_fn is None:
+            return
+
+        cartesian_chunk = self.joint_to_cartesian_fn(actions, original_batch)
+
+        # Store the Cartesian trajectory in memory for later inspection.
+        self.predicted_cartesian_chunks_history.append(cartesian_chunk.detach().cpu().clone())
+
+        if self.cartesian_to_image_fn is None:
+            return
+
+        image_trajectory = self.cartesian_to_image_fn(cartesian_chunk, original_batch)
+
+        # Store the image-space trajectory in memory for later inspection or drawing.
+        self.predicted_image_trajectory_history.append(image_trajectory.detach().cpu().clone())
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -245,6 +354,10 @@ class ACTPolicy(PreTrainedPolicy):
         """Predict a chunk of actions given environment observations."""
         self.eval()
 
+        # Keep a reference to the original input batch so optional trajectory conversion hooks
+        # can use raw observation context if needed.
+        original_batch = batch
+
         batch = self.normalize_inputs(batch)
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
@@ -262,11 +375,15 @@ class ACTPolicy(PreTrainedPolicy):
         if self.store_action_chunks:
             self.predicted_action_chunks_history.append(actions.detach().cpu().clone())
 
+        # Optionally convert the predicted joint-space chunk into Cartesian and image-space trajectories.
+        # This is only active when user-provided kinematics / projection hooks are registered.
+        self._compute_projected_trajectories(actions, original_batch)
+
         # Print an occasional compact summary so a human can understand what the robot is about to do.
         self._maybe_print_action_summary(actions)
 
         return actions
-
+    
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
         batch = self.normalize_inputs(batch)
